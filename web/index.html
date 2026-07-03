@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VOD Upload Test Client</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; }
+  label { display: block; margin-top: 12px; font-weight: 600; }
+  input, button { font-size: 14px; padding: 6px 10px; margin-top: 4px; }
+  button { cursor: pointer; }
+  #log { white-space: pre-wrap; background: #111; color: #c9f5c9; padding: 12px; margin-top: 20px; height: 320px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+  progress { width: 100%; margin-top: 8px; }
+  #statusPanel { margin-top: 20px; padding: 12px; border: 1px solid #ccc; border-radius: 6px; }
+  #statusPanel span.completed { color: green; font-weight: 600; }
+  #statusPanel span.failed { color: red; font-weight: 600; }
+  #statusPanel span.pending, #statusPanel span.processing { color: #b8860b; font-weight: 600; }
+  video { width: 100%; margin-top: 12px; background: #000; }
+  #thumbs img { height: 90px; margin-right: 8px; border: 1px solid #ccc; }
+  #qualityRow { margin-top: 16px; padding: 8px 12px; background: #eef3ff; border: 2px solid #3b6fd4; border-radius: 6px; }
+  #qualityRow label { display: inline; font-weight: 700; color: #3b6fd4; margin-right: 8px; }
+  #qualitySelect { font-size: 15px; padding: 4px 8px; }
+</style>
+</head>
+<body>
+<h1>VOD Upload Test Client</h1>
+
+<label for="apiBase">API base URL</label>
+<input id="apiBase" value="http://localhost:8080" size="40">
+
+<label for="storageBase">Storage (MinIO) base URL</label>
+<input id="storageBase" value="http://localhost:9000/vod-videos" size="40">
+
+<label for="apiKey">API key (leave blank if auth is disabled)</label>
+<input id="apiKey" value="" size="40" type="password">
+
+<label for="title">Title</label>
+<input id="title" value="My Test Video" size="40">
+
+<label for="file">Video file</label>
+<input id="file" type="file" accept="video/*">
+
+<div>
+  <button id="uploadBtn">Upload</button>
+</div>
+
+<progress id="progress" value="0" max="100"></progress>
+
+<div id="statusPanel" style="display:none">
+  <div>video_id: <code id="videoIdLabel"></code></div>
+  <div>encoding (HLS): <span id="encodingStatus">-</span></div>
+  <div>thumbnail: <span id="thumbnailStatus">-</span></div>
+  <div>caption: <span id="captionStatus">-</span></div>
+  <div id="thumbs"></div>
+  <div id="qualityRow" style="display:none">
+    <label for="qualitySelect">Video quality:</label>
+    <select id="qualitySelect"></select>
+  </div>
+  <video id="player" controls crossorigin="anonymous" style="display:none"></video>
+</div>
+
+<div id="log"></div>
+
+<script>
+const logEl = document.getElementById('log');
+function log(msg) {
+  logEl.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let pollHandle = null;
+
+function apiBase() {
+  return document.getElementById('apiBase').value.replace(/\/$/, '');
+}
+function storageBase() {
+  return document.getElementById('storageBase').value.replace(/\/$/, '');
+}
+
+// authHeaders merges in Authorization only when an API key is actually
+// entered, so this client works unchanged against a server with auth off.
+function authHeaders(extra) {
+  const key = document.getElementById('apiKey').value;
+  return key ? { ...extra, Authorization: `Bearer ${key}` } : extra;
+}
+
+function setStatusSpan(id, status) {
+  const el = document.getElementById(id);
+  el.textContent = status;
+  el.className = status;
+}
+
+function loadThumbnails(videoId) {
+  const thumbsEl = document.getElementById('thumbs');
+  thumbsEl.innerHTML = '';
+  for (let i = 0; i < 3; i++) {
+    const img = document.createElement('img');
+    img.src = `${storageBase()}/thumbnails/${videoId}/thumb_${i}.jpg`;
+    img.onerror = () => img.remove();
+    thumbsEl.appendChild(img);
+  }
+}
+
+function attachCaptions(video, videoId) {
+  // Remove any previously attached track (e.g. from an earlier video).
+  video.querySelectorAll('track').forEach(t => t.remove());
+
+  const track = document.createElement('track');
+  track.kind = 'subtitles';
+  track.label = 'English';
+  track.srclang = 'en';
+  track.src = `${storageBase()}/captions/${videoId}/captions.vtt`;
+  track.default = true;
+  video.appendChild(track);
+
+  // `default` alone doesn't always switch a track on after it's already
+  // attached to a playing element — force it once the track data loads.
+  track.addEventListener('load', () => { track.track.mode = 'showing'; });
+}
+
+let currentHls = null;
+
+function setupQualitySelector(hls) {
+  log(`setupQualitySelector: ${hls.levels.length} levels available`);
+  document.getElementById('qualityRow').style.display = 'block';
+  const select = document.getElementById('qualitySelect');
+  select.innerHTML = '';
+
+  const autoOpt = document.createElement('option');
+  autoOpt.value = '-1';
+  autoOpt.textContent = 'Auto';
+  select.appendChild(autoOpt);
+
+  hls.levels.forEach((level, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = `${level.height}p (${Math.round(level.bitrate / 1000)}kbps)`;
+    select.appendChild(opt);
+  });
+  select.value = '-1';
+
+  select.onchange = () => { hls.currentLevel = parseInt(select.value, 10); };
+}
+
+function loadPlayer(videoId) {
+  const video = document.getElementById('player');
+  const src = `${storageBase()}/renditions/${videoId}/master.m3u8`;
+  video.style.display = 'block';
+  document.getElementById('qualityRow').style.display = 'none';
+
+  const hlsJsSupported = window.Hls && window.Hls.isSupported();
+  log(`loadPlayer: hls.js supported=${!!hlsJsSupported}, native canPlayType="${video.canPlayType('application/vnd.apple.mpegurl')}"`);
+
+  // Prefer hls.js whenever it's actually usable — it's what gives us the
+  // manual quality-level API. canPlayType() is not a reliable signal here:
+  // some Chrome builds return "maybe" for the HLS MIME type without
+  // functional native HLS support, which would otherwise wrongly route us
+  // into the native branch below and silently lose the quality selector.
+  if (hlsJsSupported) {
+    if (currentHls) currentHls.destroy();
+    const hls = new Hls();
+    currentHls = hls;
+    hls.on(Hls.Events.ERROR, (event, data) => log(`hls.js error: ${data.type} / ${data.details} (fatal=${data.fatal})`));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => setupQualitySelector(hls));
+    hls.loadSource(src);
+    hls.attachMedia(video);
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = src; // genuine Safari native HLS, no manual level API to hook a selector to
+  } else {
+    log('No HLS playback support in this browser and hls.js failed to load.');
+  }
+  attachCaptions(video, videoId);
+}
+
+function setVideoIdInURL(videoId) {
+  const url = new URL(window.location.href);
+  url.searchParams.set('video', videoId);
+  window.history.replaceState(null, '', url);
+}
+
+async function pollVideoStatus(videoId) {
+  const base = apiBase();
+  setVideoIdInURL(videoId);
+  document.getElementById('statusPanel').style.display = 'block';
+  document.getElementById('videoIdLabel').textContent = videoId;
+
+  if (pollHandle) clearInterval(pollHandle);
+  let thumbsLoaded = false;
+
+  const tick = async () => {
+    const res = await fetch(`${base}/videos/${videoId}`, { headers: authHeaders({}) });
+    if (!res.ok) { log('poll failed: ' + await res.text()); return; }
+    const video = await res.json();
+    setStatusSpan('encodingStatus', video.encoding_status);
+    setStatusSpan('thumbnailStatus', video.thumbnail_status);
+    setStatusSpan('captionStatus', video.caption_status);
+
+    if (!thumbsLoaded && video.thumbnail_status === 'completed') {
+      thumbsLoaded = true;
+      loadThumbnails(videoId);
+    }
+    if (video.encoding_status === 'completed') {
+      loadPlayer(videoId);
+      clearInterval(pollHandle);
+      log('encoding completed — player loaded.');
+    } else if (video.encoding_status === 'failed') {
+      clearInterval(pollHandle);
+      log('encoding failed — check worker logs.');
+    }
+  };
+  await tick();
+  pollHandle = setInterval(tick, 5000);
+}
+
+document.getElementById('uploadBtn').onclick = async () => {
+  const uploadBtn = document.getElementById('uploadBtn');
+  if (uploadBtn.disabled) return; // already uploading — ignore extra clicks
+  uploadBtn.disabled = true;
+  try {
+    await doUpload();
+  } finally {
+    uploadBtn.disabled = false;
+  }
+};
+
+// Resume support: an in-progress upload is identified by filename + size +
+// lastModified (cheap, no hashing needed — good enough to tell "probably
+// the same file" apart from "a different file"). Persisted to localStorage
+// so it survives a closed tab or page refresh, which in-memory state never
+// could.
+const RESUME_KEY = 'vod_pending_upload';
+
+function fileFingerprint(file) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function savePendingUpload(file, uploadId, partSize, partCount, title) {
+  localStorage.setItem(RESUME_KEY, JSON.stringify({
+    fingerprint: fileFingerprint(file), uploadId, partSize, partCount, title,
+  }));
+}
+
+function loadPendingUpload(file) {
+  const raw = localStorage.getItem(RESUME_KEY);
+  if (!raw) return null;
+  const saved = JSON.parse(raw);
+  return saved.fingerprint === fileFingerprint(file) ? saved : null;
+}
+
+function clearPendingUpload() {
+  localStorage.removeItem(RESUME_KEY);
+}
+
+document.getElementById('file').addEventListener('change', async () => {
+  const file = document.getElementById('file').files[0];
+  if (!file) return;
+  const pending = loadPendingUpload(file);
+  if (!pending) return;
+
+  const base = apiBase();
+  const res = await fetch(`${base}/uploads/${pending.uploadId}/status`, { headers: authHeaders({}) });
+  if (!res.ok) {
+    log('Found a saved upload for this file, but its session has expired — will start fresh.');
+    clearPendingUpload();
+    return;
+  }
+  const status = await res.json();
+  log(`Found an incomplete upload for this exact file: ${status.received_parts.length}/${pending.partCount} parts already uploaded. Click Upload to resume from where it left off.`);
+});
+
+async function doUpload() {
+  const base = apiBase();
+  const title = document.getElementById('title').value;
+  const fileInput = document.getElementById('file');
+  const file = fileInput.files[0];
+  if (!file) { log('Pick a file first.'); return; }
+
+  let uploadId, partSize, partCount, receivedParts = new Set();
+
+  const pending = loadPendingUpload(file);
+  if (pending) {
+    const statusRes = await fetch(`${base}/uploads/${pending.uploadId}/status`, { headers: authHeaders({}) });
+    if (statusRes.ok) {
+      const status = await statusRes.json();
+      uploadId = pending.uploadId;
+      partSize = pending.partSize;
+      partCount = pending.partCount;
+      receivedParts = new Set(status.received_parts);
+      log(`Resuming upload_id=${uploadId}: ${receivedParts.size}/${partCount} parts already on the server, uploading the rest.`);
+    } else {
+      log('Saved upload session expired server-side — starting a fresh upload instead.');
+      clearPendingUpload();
+    }
+  }
+
+  if (!uploadId) {
+    log(`Creating upload for "${title}" (${file.size} bytes)...`);
+    const createRes = await fetch(`${base}/uploads`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ title, file_size_bytes: file.size, content_type: file.type || 'video/mp4' }),
+    });
+    if (!createRes.ok) { log('Create failed: ' + await createRes.text()); return; }
+    ({ upload_id: uploadId, part_size: partSize, part_count: partCount } = await createRes.json());
+    log(`upload_id=${uploadId} part_size=${partSize} part_count=${partCount}`);
+    savePendingUpload(file, uploadId, partSize, partCount, title);
+  }
+
+  for (let n = 1; n <= partCount; n++) {
+    if (receivedParts.has(n)) {
+      document.getElementById('progress').value = Math.round((n / partCount) * 100);
+      continue; // already uploaded in a previous attempt — this is the resume
+    }
+
+    const start = (n - 1) * partSize;
+    const end = Math.min(start + partSize, file.size);
+    const chunk = file.slice(start, end);
+
+    const presignRes = await fetch(`${base}/uploads/${uploadId}/parts/${n}/presigned-url`, { headers: authHeaders({}) });
+    if (!presignRes.ok) { log(`Presign part ${n} failed: ` + await presignRes.text()); return; }
+    const { url } = await presignRes.json();
+
+    log(`Uploading part ${n}/${partCount} (${chunk.size} bytes)...`);
+    const putRes = await fetch(url, { method: 'PUT', body: chunk });
+    if (!putRes.ok) { log(`Part ${n} upload failed: ${putRes.status}`); return; }
+
+    document.getElementById('progress').value = Math.round((n / partCount) * 100);
+  }
+
+  log('All parts uploaded. Completing...');
+  const completeRes = await fetch(`${base}/uploads/${uploadId}/complete`, { method: 'POST', headers: authHeaders({}) });
+  if (!completeRes.ok) { log('Complete failed: ' + await completeRes.text()); return; }
+  const video = await completeRes.json();
+  clearPendingUpload();
+  log('Upload complete: ' + JSON.stringify(video, null, 2));
+  log('Polling processing status every 5s (encoding HLS takes a few minutes for real video)...');
+  pollVideoStatus(video.id);
+}
+
+// Resume polling on page load/refresh if the URL already names a video —
+// this is what survives a refresh, not any in-memory JS state.
+const existingVideoId = new URL(window.location.href).searchParams.get('video');
+if (existingVideoId) {
+  log(`Resuming status for video_id=${existingVideoId} from URL...`);
+  pollVideoStatus(existingVideoId);
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+# Builds the whisper-worker with a real, local, CPU-only speech-to-text
+# backend (whisper.cpp) baked into the image — no external API call at
+# runtime, no GPU, no per-request cost. Falls back to a stub transcriber at
+# runtime only if this build step is somehow skipped.
+
+FROM golang:1.25 AS go-build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/worker ./cmd/whisper-worker
+
+# whisper.cpp build stage: compiles the CLI and downloads a CPU-sized model
+# (base.en, ~148MB — English-only, a reasonable speed/accuracy trade-off for
+# a worker with no GPU). Pin a specific tag so builds are reproducible.
+FROM debian:bookworm-slim AS whisper-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /whisper
+RUN git clone --depth 1 --branch v1.7.4 https://github.com/ggml-org/whisper.cpp.git .
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release -j"$(nproc)"
+RUN mkdir -p /models && wget -q -O /models/ggml-base.en.bin \
+    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+# build/bin/main, bench, command, and stream are all identical ~17KB
+# deprecation-notice shims (whisper.cpp's compatibility layer for renamed
+# binaries) that print a warning and exit 1 — not the real tool. The actual
+# CLI is build/bin/whisper-cli (dynamically linked against libwhisper/libggml,
+# several hundred KB). Copy that exact path, not a name-based find, so a
+# shim can never silently win again.
+RUN cp build/bin/whisper-cli /usr/local/bin/whisper-cli
+# The real binary links against libwhisper.so / libggml*.so built alongside
+# it — carry those into the runtime stage too.
+RUN mkdir -p /libs && cp build/src/libwhisper.so* build/ggml/src/libggml*.so /libs/
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=whisper-build /usr/local/bin/whisper-cli /usr/local/bin/whisper-cli
+COPY --from=whisper-build /libs/ /usr/local/lib/
+RUN ldconfig
+COPY --from=whisper-build /models/ggml-base.en.bin /models/ggml-base.en.bin
+COPY --from=go-build /out/worker /usr/local/bin/worker
+ENV WHISPER_CPP_BIN=/usr/local/bin/whisper-cli
+ENV WHISPER_CPP_MODEL=/models/ggml-base.en.bin
+ENTRYPOINT ["/usr/local/bin/worker"]

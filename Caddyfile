@@ -1,0 +1,13 @@
+# Local TLS termination in front of upload-service. "tls internal" makes
+# Caddy generate and use its own local CA instead of trying ACME/Let's
+# Encrypt, which only works for real public domains — there's no public
+# domain here, just localhost.
+localhost:8443 {
+	tls internal
+
+	# upload-service's clientIP() reads this to rate-limit by the real
+	# client IP rather than Caddy's own container address.
+	reverse_proxy upload-service:8080 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}

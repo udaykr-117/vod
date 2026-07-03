@@ -1,0 +1,15 @@
+# Shared build for the three workers (ffmpeg, thumbnail, whisper). They all
+# shell out to ffmpeg/ffprobe, so the runtime stage installs it; CMD_PATH
+# selects which cmd/ binary this image actually runs.
+FROM golang:1.25-alpine AS build
+ARG CMD_PATH
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/worker ./${CMD_PATH}
+
+FROM alpine:3.20
+RUN apk add --no-cache ffmpeg ca-certificates
+COPY --from=build /out/worker /usr/local/bin/worker
+ENTRYPOINT ["/usr/local/bin/worker"]

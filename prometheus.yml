@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: upload-service
+    static_configs:
+      - targets: ["upload-service:8080"]
+
+  - job_name: ffmpeg-worker
+    static_configs:
+      - targets: ["ffmpeg-worker:9090"]
+
+  - job_name: thumbnail-worker
+    static_configs:
+      - targets: ["thumbnail-worker:9090"]
+
+  - job_name: whisper-worker
+    static_configs:
+      - targets: ["whisper-worker:9090"]
